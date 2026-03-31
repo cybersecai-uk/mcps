@@ -1,0 +1,1253 @@
+/**
+ * MCPS -- MCP Secure
+ * Cryptographic identity, message signing, and trust verification for MCP.
+ *
+ * Copyright (c) 2026 CyberSecAI Ltd. All rights reserved.
+ * Patent: GB2604808.2
+ * License: MIT
+ *
+ * Specification: SEP-2395 (Cryptographic Security Layer for MCP)
+ * Canonicalization: RFC 8785 (JSON Canonicalization Scheme)
+ * Signing: ECDSA P-256 (NIST FIPS 186-5, RFC 6979)
+ * Signature Format: IEEE P1363 r||s fixed-length (RFC 7518 Section 3.4)
+ */
+
+'use strict';
+
+const crypto = require('crypto');
+const https = require('https');
+const http = require('http');
+
+/* ─────────────────────── Constants ─────────────────────── */
+
+const MCPS_VERSION = '1.0';
+const SUPPORTED_VERSIONS = ['1.0'];
+const NONCE_BYTES = 16;
+const TIMESTAMP_WINDOW_MS = 5 * 60 * 1000; // 5 minutes
+const DEFAULT_TRUST_AUTHORITY = 'https://agentsign.dev';
+const PASSPORT_PREFIX = 'asp_';
+const CURVE = 'prime256v1'; // NIST P-256 / secp256r1
+
+// P-256 curve order (FIPS 186-5) for low-S normalization
+const P256_ORDER = BigInt('0xFFFFFFFF00000000FFFFFFFFFFFFFFFFBCE6FAADA7179E84F3B9CAC2FC632551');
+const P256_HALF_ORDER = P256_ORDER >> 1n;
+const P1363_SIG_LENGTH = 64; // 32 bytes r + 32 bytes s for P-256
+
+// Passport size limits (DoS prevention)
+const MAX_ISSUER_CHAIN_DEPTH = 5;
+const MAX_PASSPORT_BYTES = 8192;
+const MAX_CAPABILITIES = 64;
+
+const TRUST_LEVELS = {
+  UNSIGNED: 0,    // Plain MCP, no MCPS -- self-signed passports capped here
+  IDENTIFIED: 1,  // Passport signed by any Trust Authority
+  VERIFIED: 2,    // Passport signed by recognized TA (in verifier's trust store)
+  SCANNED: 3,     // Verified + TA verified origin ownership
+  AUDITED: 4,     // Scanned + TA performed security audit + revocation required
+};
+
+// Error codes: string code + JSON-RPC numeric code
+// Numeric codes use -33xxx to avoid collision with JSON-RPC reserved range (-32000 to -32099)
+const ERROR_CODES = {
+  INVALID_PASSPORT:       { code: 'MCPS-001', jsonrpc_code: -33001, message: 'Invalid passport format' },
+  PASSPORT_EXPIRED:       { code: 'MCPS-002', jsonrpc_code: -33002, message: 'Passport expired' },
+  PASSPORT_REVOKED:       { code: 'MCPS-003', jsonrpc_code: -33003, message: 'Passport revoked' },
+  INVALID_SIGNATURE:      { code: 'MCPS-004', jsonrpc_code: -33004, message: 'Invalid message signature' },
+  REPLAY_ATTACK:          { code: 'MCPS-005', jsonrpc_code: -33005, message: 'Replay attack detected' },
+  TIMESTAMP_OUT_OF_WINDOW:{ code: 'MCPS-006', jsonrpc_code: -33006, message: 'Timestamp out of window' },
+  AUTHORITY_UNREACHABLE:  { code: 'MCPS-007', jsonrpc_code: -33007, message: 'Trust authority unreachable' },
+  TOOL_INTEGRITY_FAILED:  { code: 'MCPS-008', jsonrpc_code: -33008, message: 'Tool definition signature invalid or hash changed' },
+  INSUFFICIENT_TRUST:     { code: 'MCPS-009', jsonrpc_code: -33009, message: 'Insufficient trust level' },
+  RATE_LIMITED:           { code: 'MCPS-010', jsonrpc_code: -33010, message: 'Rate limit exceeded' },
+  ORIGIN_MISMATCH:        { code: 'MCPS-011', jsonrpc_code: -33011, message: 'Passport origin does not match server URI' },
+  CAPABILITY_MISMATCH:    { code: 'MCPS-012', jsonrpc_code: -33012, message: 'Transcript binding verification failed (downgrade detected)' },
+  PASSPORT_TOO_LARGE:     { code: 'MCPS-013', jsonrpc_code: -33013, message: 'Passport exceeds maximum size' },
+  CHAIN_TOO_DEEP:         { code: 'MCPS-014', jsonrpc_code: -33014, message: 'Issuer chain exceeds maximum depth' },
+  VERSION_MISMATCH:       { code: 'MCPS-015', jsonrpc_code: -33015, message: 'No mutually supported MCPS version' },
+};
+
+/* ─────────────────────── RFC 8785: JSON Canonicalization Scheme ─────────────────────── */
+
+/**
+ * Deterministic JSON serialization per RFC 8785 (JCS).
+ * Guarantees identical bytes across Node.js and Python for the same logical value.
+ *
+ * Key properties:
+ * - Object keys sorted lexicographically (Unicode code point order)
+ * - No whitespace between tokens
+ * - Numbers: ES2024 Number.toString() semantics (1.0 → "1", no trailing zeros)
+ * - Strings: minimal JSON escaping
+ * - Recursive for nested objects
+ */
+function canonicalJSON(obj) {
+  if (obj === null || obj === undefined) return 'null';
+  if (typeof obj === 'boolean') return obj ? 'true' : 'false';
+  if (typeof obj === 'number') {
+    if (!isFinite(obj)) throw new Error('Infinity/NaN not allowed in JCS');
+    if (Object.is(obj, -0)) return '0';
+    return String(obj);
+  }
+  if (typeof obj === 'string') return JSON.stringify(obj);
+  if (Array.isArray(obj)) return '[' + obj.map(canonicalJSON).join(',') + ']';
+  const keys = Object.keys(obj).sort();
+  return '{' + keys.map(k => JSON.stringify(k) + ':' + canonicalJSON(obj[k])).join(',') + '}';
+}
+
+/* ─────────────────────── ECDSA P1363 Signing with Low-S ─────────────────────── */
+
+/**
+ * Check if a key is an external signer (HSM, KMS, PKCS#11).
+ *
+ * External signers are objects with a `sign(data)` method or bare async functions.
+ * They allow private keys to stay in hardware — the key never touches Node.js memory.
+ *
+ * Supported forms:
+ *   1. Function:  async (data: Buffer) => Buffer|string (base64 P1363 r||s)
+ *   2. Object:    { sign: async (data: Buffer) => Buffer|string }
+ *   3. PEM string: standard Node.js crypto (existing behavior)
+ *
+ * @param {*} key
+ * @returns {boolean}
+ */
+function _isExternalSigner(key) {
+  if (typeof key === 'function') return true;
+  if (key && typeof key === 'object' && typeof key.sign === 'function') return true;
+  return false;
+}
+
+/**
+ * Call an external signer and normalize the result to base64 P1363.
+ * HSM providers return different formats — this normalizes them all.
+ *
+ * @param {Function|{sign:Function}} signer
+ * @param {Buffer} data - SHA-256 digest or raw data (depends on HSM config)
+ * @returns {Promise<string>} Base64-encoded P1363 signature
+ */
+async function _callExternalSigner(signer, data) {
+  const signFn = typeof signer === 'function' ? signer : signer.sign.bind(signer);
+  const result = await signFn(data);
+
+  // Normalize result to base64 string
+  if (Buffer.isBuffer(result)) return result.toString('base64');
+  if (result instanceof Uint8Array) return Buffer.from(result).toString('base64');
+  if (typeof result === 'string') return result; // assume base64 already
+  throw new Error('External signer must return Buffer, Uint8Array, or base64 string');
+}
+
+/**
+ * Sign data using ECDSA P-256 with IEEE P1363 format and low-S normalization.
+ *
+ * Output: base64-encoded r||s (exactly 64 bytes for P-256).
+ * Low-S normalization prevents signature malleability (BIP-0062).
+ * Format per RFC 7518 Section 3.4.
+ *
+ * @param {string|Buffer} data - Data to sign
+ * @param {string} privateKey - PEM private key
+ * @returns {string} Base64-encoded P1363 signature with low-S
+ */
+function _signBytes(data, privateKey) {
+  const sigBuf = crypto.sign('SHA256', Buffer.from(data), {
+    key: privateKey,
+    dsaEncoding: 'ieee-p1363',
+  });
+
+  // Low-S normalization: if s > n/2, replace with n - s
+  const s = BigInt('0x' + sigBuf.subarray(32, 64).toString('hex'));
+  if (s > P256_HALF_ORDER) {
+    const sNorm = P256_ORDER - s;
+    const sBytes = Buffer.from(sNorm.toString(16).padStart(64, '0'), 'hex');
+    const normalized = Buffer.alloc(P1363_SIG_LENGTH);
+    sigBuf.copy(normalized, 0, 0, 32); // r unchanged
+    sBytes.copy(normalized, 32);        // s normalized
+    return normalized.toString('base64');
+  }
+  return sigBuf.toString('base64');
+}
+
+/**
+ * Sign data using either a local PEM key (sync) or an external HSM signer (async).
+ *
+ * @param {string|Buffer} data - Data to sign
+ * @param {string|Function|{sign:Function}} key - PEM string OR external signer
+ * @returns {string|Promise<string>} Signature (sync for PEM, Promise for HSM)
+ */
+function _signBytesWithKey(data, key) {
+  if (!_isExternalSigner(key)) return _signBytes(data, key);
+  return _callExternalSigner(key, Buffer.from(data));
+}
+
+/**
+ * Verify an ECDSA P1363 signature with low-S normalization.
+ * Accepts and normalizes high-S signatures for interoperability.
+ *
+ * @param {string|Buffer} data - Original data
+ * @param {string} signatureB64 - Base64-encoded P1363 signature
+ * @param {string} publicKey - PEM public key
+ * @returns {boolean}
+ */
+function _verifyBytes(data, signatureB64, publicKey) {
+  try {
+    let sigBuf = Buffer.from(signatureB64, 'base64');
+    if (sigBuf.length !== P1363_SIG_LENGTH) return false;
+
+    // Low-S normalization for verification (accept high-S from non-normalizing signers)
+    const s = BigInt('0x' + sigBuf.subarray(32, 64).toString('hex'));
+    if (s > P256_HALF_ORDER) {
+      const sNorm = P256_ORDER - s;
+      const sBytes = Buffer.from(sNorm.toString(16).padStart(64, '0'), 'hex');
+      sigBuf = Buffer.concat([sigBuf.subarray(0, 32), sBytes]);
+    }
+
+    return crypto.verify('SHA256', Buffer.from(data), {
+      key: publicKey,
+      dsaEncoding: 'ieee-p1363',
+    }, sigBuf);
+  } catch {
+    return false;
+  }
+}
+
+/* ─────────────────────── Key Generation ─────────────────────── */
+
+/**
+ * Generate an ECDSA P-256 key pair for MCPS signing.
+ * @returns {{ publicKey: string, privateKey: string }} PEM-encoded keys
+ */
+function generateKeyPair() {
+  const { publicKey, privateKey } = crypto.generateKeyPairSync('ec', {
+    namedCurve: CURVE,
+    publicKeyEncoding:  { type: 'spki',  format: 'pem' },
+    privateKeyEncoding: { type: 'pkcs8', format: 'pem' },
+  });
+  return { publicKey, privateKey };
+}
+
+/**
+ * Export public key as compact JWK for passport embedding.
+ */
+function publicKeyToJWK(publicKeyPem) {
+  const keyObj = crypto.createPublicKey(publicKeyPem);
+  return keyObj.export({ format: 'jwk' });
+}
+
+/* ─────────────────────── Passport ─────────────────────── */
+
+/**
+ * Create an agent passport.
+ * @param {object} opts
+ * @param {string} opts.name - Agent name
+ * @param {string} opts.version - Agent version
+ * @param {string} opts.publicKey - PEM public key
+ * @param {string} opts.origin - URI of the authorized server (e.g. https://api.example.com)
+ * @param {string[]} [opts.capabilities] - Agent capabilities (max 64)
+ * @param {object} [opts.scanResults] - SDLC scan results
+ * @param {number} [opts.ttlDays=365] - Days until expiration
+ * @param {string} [opts.issuer='self'] - Issuer identifier
+ * @param {string[]} [opts.issuerChain] - Chain of base64url-encoded intermediate TA passports
+ * @param {string} [opts.previousKeyHash] - SHA-256 hash of previous public key (for key rotation)
+ * @returns {object} Unsigned passport
+ */
+function createPassport(opts) {
+  const id = PASSPORT_PREFIX + crypto.randomBytes(16).toString('hex');
+  const now = new Date();
+  const expires = new Date(now.getTime() + (opts.ttlDays || 365) * 86400000);
+
+  // Self-signed passports are ALWAYS L0 per SEP-2395 Section 6.1
+  const isSelfSigned = !opts.issuer || opts.issuer === 'self';
+  let trustLevel;
+  if (isSelfSigned) {
+    trustLevel = TRUST_LEVELS.UNSIGNED;
+  } else if (opts.scanResults) {
+    trustLevel = TRUST_LEVELS.SCANNED;
+  } else {
+    trustLevel = TRUST_LEVELS.IDENTIFIED;
+  }
+
+  const passport = {
+    mcps_version: MCPS_VERSION,
+    passport_id: id,
+    agent: {
+      name: opts.name,
+      version: opts.version || '1.0.0',
+      capabilities: (opts.capabilities || []).slice(0, MAX_CAPABILITIES),
+    },
+    public_key: publicKeyToJWK(opts.publicKey),
+    origin: opts.origin || null,
+    scan: opts.scanResults || null,
+    trust_level: trustLevel,
+    issued_at: now.toISOString(),
+    expires_at: expires.toISOString(),
+    issuer: opts.issuer || 'self',
+    issuer_chain: (opts.issuerChain || []).slice(0, MAX_ISSUER_CHAIN_DEPTH),
+  };
+
+  // Key rotation: link to previous key for compromise recovery
+  if (opts.previousKeyHash) {
+    passport.key_rotation = {
+      previous_key_hash: opts.previousKeyHash,
+      rotated_at: now.toISOString(),
+    };
+  }
+
+  return passport;
+}
+
+/**
+ * Sign a passport with the Trust Authority's private key.
+ * Uses RFC 8785 (JCS) for canonical serialization before signing.
+ * Signature: IEEE P1363 r||s with low-S normalization.
+ *
+ * Supports HSM/KMS: pass an external signer instead of a PEM key.
+ * When using an external signer, this function returns a Promise.
+ *
+ * @param {object} passport - The passport object
+ * @param {string|Function|{sign:Function}} authorityPrivateKey - PEM key OR external signer
+ * @returns {object|Promise<object>} Signed passport
+ */
+function signPassport(passport, authorityPrivateKey) {
+  const payload = canonicalJSON(passport);
+
+  if (_isExternalSigner(authorityPrivateKey)) {
+    return _callExternalSigner(authorityPrivateKey, Buffer.from(payload))
+      .then(signature => ({ ...passport, signature }));
+  }
+
+  const signature = _signBytes(payload, authorityPrivateKey);
+  return { ...passport, signature };
+}
+
+/**
+ * Verify a passport's signature against the Trust Authority's public key.
+ */
+function verifyPassportSignature(passport, authorityPublicKey) {
+  const { signature, ...rest } = passport;
+  if (!signature) return false;
+  const payload = canonicalJSON(rest);
+  return _verifyBytes(payload, signature, authorityPublicKey);
+}
+
+/**
+ * Check if a passport has expired.
+ */
+function isPassportExpired(passport) {
+  return new Date(passport.expires_at) < new Date();
+}
+
+/**
+ * Validate passport format including origin binding and size limits.
+ * Self-signed passports are capped at L0 regardless of trust_level field.
+ */
+function validatePassportFormat(passport) {
+  if (!passport) return { valid: false, error: ERROR_CODES.INVALID_PASSPORT };
+  if (!passport.passport_id?.startsWith(PASSPORT_PREFIX)) return { valid: false, error: ERROR_CODES.INVALID_PASSPORT };
+  if (!passport.public_key) return { valid: false, error: ERROR_CODES.INVALID_PASSPORT };
+  if (!passport.issued_at || !passport.expires_at) return { valid: false, error: ERROR_CODES.INVALID_PASSPORT };
+  if (isPassportExpired(passport)) return { valid: false, error: ERROR_CODES.PASSPORT_EXPIRED };
+
+  // Size limits (DoS prevention)
+  if (passport.issuer_chain && passport.issuer_chain.length > MAX_ISSUER_CHAIN_DEPTH) {
+    return { valid: false, error: ERROR_CODES.CHAIN_TOO_DEEP };
+  }
+  const serialized = canonicalJSON(passport);
+  if (Buffer.byteLength(serialized) > MAX_PASSPORT_BYTES) {
+    return { valid: false, error: ERROR_CODES.PASSPORT_TOO_LARGE };
+  }
+
+  return { valid: true };
+}
+
+/**
+ * Validate that a passport's origin matches the expected server URI.
+ * Origin comparison uses scheme + authority (host + port) per RFC 6454.
+ */
+function validateOrigin(passport, expectedOrigin) {
+  if (!passport.origin) return { valid: false, error: ERROR_CODES.ORIGIN_MISMATCH };
+  if (!expectedOrigin) return { valid: true };
+
+  try {
+    const passportUrl = new URL(passport.origin);
+    const expectedUrl = new URL(expectedOrigin);
+    const match = passportUrl.protocol === expectedUrl.protocol
+      && passportUrl.hostname === expectedUrl.hostname
+      && passportUrl.port === expectedUrl.port;
+    return match ? { valid: true } : { valid: false, error: ERROR_CODES.ORIGIN_MISMATCH };
+  } catch {
+    return { valid: false, error: ERROR_CODES.ORIGIN_MISMATCH };
+  }
+}
+
+/**
+ * Get the effective trust level for a passport.
+ * Self-signed passports are ALWAYS capped at L0.
+ * Unknown issuers are treated as L0.
+ */
+function getEffectiveTrustLevel(passport, trustedIssuers) {
+  if (!passport.issuer || passport.issuer === 'self') return TRUST_LEVELS.UNSIGNED;
+  if (trustedIssuers && !trustedIssuers.includes(passport.issuer)) return TRUST_LEVELS.UNSIGNED;
+  return passport.trust_level || TRUST_LEVELS.UNSIGNED;
+}
+
+/**
+ * Verify an issuer chain from agent passport up to a trusted root.
+ *
+ * Each issuer_chain entry is a base64url-encoded JSON intermediate TA passport
+ * containing its own signature, public_key, issuer, and other standard fields.
+ *
+ * Chain verification walks: agent → intermediate(s) → root TA.
+ * Max chain depth: MAX_ISSUER_CHAIN_DEPTH (5).
+ *
+ * @param {object} passport - The passport with issuer_chain field
+ * @param {object} trustStore - Map of issuer ID -> PEM public key
+ * @returns {{ valid: boolean, chain_length: number, root_issuer?: string, error?: string }}
+ */
+function verifyIssuerChain(passport, trustStore) {
+  if (!passport.issuer) return { valid: false, chain_length: 0 };
+
+  const chain = passport.issuer_chain || [];
+  if (chain.length > MAX_ISSUER_CHAIN_DEPTH) {
+    return { valid: false, chain_length: chain.length, error: 'chain_too_deep' };
+  }
+
+  // Direct trust: issuer is in trust store
+  if (trustStore[passport.issuer]) {
+    const isValid = verifyPassportSignature(passport, trustStore[passport.issuer]);
+    return { valid: isValid, chain_length: 1, root_issuer: isValid ? passport.issuer : undefined };
+  }
+
+  // No chain to walk
+  if (chain.length === 0) {
+    return { valid: false, chain_length: 0 };
+  }
+
+  // Decode chain entries: each is base64url-encoded JSON intermediate TA passport
+  const intermediates = [];
+  for (const entry of chain) {
+    try {
+      const decoded = Buffer.from(entry, 'base64').toString('utf8');
+      intermediates.push(JSON.parse(decoded));
+    } catch {
+      return { valid: false, chain_length: chain.length, error: 'invalid_chain_entry' };
+    }
+  }
+
+  // Walk chain: verify each link from agent passport up to root
+  let current = passport;
+  for (let i = 0; i < intermediates.length; i++) {
+    const intermediate = intermediates[i];
+
+    if (!intermediate.public_key) {
+      return { valid: false, chain_length: i, error: 'intermediate_missing_key' };
+    }
+
+    // Convert intermediate's JWK public key to PEM
+    let intermediatePem;
+    try {
+      intermediatePem = crypto.createPublicKey({ key: intermediate.public_key, format: 'jwk' })
+        .export({ type: 'spki', format: 'pem' });
+    } catch {
+      return { valid: false, chain_length: i, error: 'invalid_intermediate_key' };
+    }
+
+    // Verify current passport was signed by this intermediate
+    if (!verifyPassportSignature(current, intermediatePem)) {
+      return { valid: false, chain_length: i, error: 'signature_verification_failed' };
+    }
+
+    // Check if this intermediate's issuer is a trusted root
+    if (intermediate.issuer && trustStore[intermediate.issuer]) {
+      if (verifyPassportSignature(intermediate, trustStore[intermediate.issuer])) {
+        return { valid: true, chain_length: i + 2, root_issuer: intermediate.issuer };
+      }
+    }
+
+    current = intermediate;
+  }
+
+  return { valid: false, chain_length: intermediates.length, error: 'no_trusted_root' };
+}
+
+/* ─────────────────────── Message Signing ─────────────────────── */
+
+/**
+ * Wrap an MCP JSON-RPC message in an MCPS signed envelope.
+ *
+ * Signing payload uses SHA-256 hash of JCS(message) to avoid double-canonicalization
+ * fragility (embedding one JCS string inside another JCS object).
+ *
+ * Supports HSM/KMS: pass an external signer instead of a PEM key.
+ * When using an external signer, this function returns a Promise.
+ *
+ * @param {object} mcpMessage - The original MCP JSON-RPC message
+ * @param {string} passportId - The agent's passport ID
+ * @param {string|Function|{sign:Function}} privateKey - PEM private key OR external signer (HSM/KMS)
+ * @param {object} [opts] - Options
+ * @param {string} [opts.channelBinding] - TLS channel binding token (tls-exporter per RFC 9266)
+ * @returns {object|Promise<object>} MCPS envelope (sync for PEM, Promise for HSM)
+ */
+function signMessage(mcpMessage, passportId, privateKey, opts) {
+  const nonce = crypto.randomBytes(NONCE_BYTES).toString('hex');
+  const timestamp = new Date().toISOString();
+
+  // Hash message instead of nesting JCS strings (prevents double-canonicalization fragility)
+  const messageHash = crypto.createHash('sha256')
+    .update(canonicalJSON(mcpMessage))
+    .digest('hex');
+
+  const sigPayloadObj = {
+    message_hash: messageHash,
+    nonce: nonce,
+    passport_id: passportId,
+    timestamp: timestamp,
+  };
+
+  // Optional TLS channel binding (RFC 9266 tls-exporter)
+  if (opts && opts.channelBinding) {
+    sigPayloadObj.channel_binding = opts.channelBinding;
+  }
+
+  const sigPayload = canonicalJSON(sigPayloadObj);
+
+  const buildEnvelope = (signature) => ({
+    mcps: {
+      version: MCPS_VERSION,
+      passport_id: passportId,
+      timestamp,
+      nonce,
+      signature,
+    },
+    ...mcpMessage,
+  });
+
+  // HSM/KMS path: async
+  if (_isExternalSigner(privateKey)) {
+    return _callExternalSigner(privateKey, Buffer.from(sigPayload))
+      .then(buildEnvelope);
+  }
+
+  // Software key path: sync (no breaking change)
+  return buildEnvelope(_signBytes(sigPayload, privateKey));
+}
+
+/**
+ * Verify an MCPS envelope's signature.
+ *
+ * @param {object} envelope - The MCPS envelope
+ * @param {string} publicKeyPem - PEM public key from the agent's passport
+ * @param {object} [opts] - Options
+ * @param {string} [opts.channelBinding] - Expected TLS channel binding token
+ * @returns {{ valid: boolean, error?: object }}
+ */
+function verifyMessage(envelope, publicKeyPem, opts) {
+  if (!envelope || !envelope.mcps || !envelope.mcps.signature) {
+    return { valid: false, error: ERROR_CODES.INVALID_SIGNATURE };
+  }
+
+  const { mcps: mcpsField, ...jsonrpcMessage } = envelope;
+
+  // Check timestamp window
+  const msgTime = new Date(mcpsField.timestamp).getTime();
+  if (isNaN(msgTime)) {
+    return { valid: false, error: ERROR_CODES.TIMESTAMP_OUT_OF_WINDOW };
+  }
+  const now = Date.now();
+  if (Math.abs(now - msgTime) > TIMESTAMP_WINDOW_MS) {
+    return { valid: false, error: ERROR_CODES.TIMESTAMP_OUT_OF_WINDOW };
+  }
+
+  // Reconstruct signing payload (message hash, not nested JCS)
+  const messageHash = crypto.createHash('sha256')
+    .update(canonicalJSON(jsonrpcMessage))
+    .digest('hex');
+
+  const sigPayloadObj = {
+    message_hash: messageHash,
+    nonce: mcpsField.nonce,
+    passport_id: mcpsField.passport_id,
+    timestamp: mcpsField.timestamp,
+  };
+
+  if (opts && opts.channelBinding) {
+    sigPayloadObj.channel_binding = opts.channelBinding;
+  }
+
+  const sigPayload = canonicalJSON(sigPayloadObj);
+  const valid = _verifyBytes(sigPayload, mcpsField.signature, publicKeyPem);
+  return valid ? { valid: true } : { valid: false, error: ERROR_CODES.INVALID_SIGNATURE };
+}
+
+/* ─────────────────────── Nonce Store (Replay Protection) ─────────────────────── */
+
+class NonceStore {
+  constructor(windowMs = TIMESTAMP_WINDOW_MS) {
+    this.nonces = new Map();
+    this.windowMs = windowMs;
+    this._gcInterval = setInterval(() => this._gc(), windowMs);
+    if (this._gcInterval.unref) this._gcInterval.unref();
+  }
+
+  check(nonce) {
+    if (this.nonces.has(nonce)) return false;
+    this.nonces.set(nonce, Date.now());
+    return true;
+  }
+
+  _gc() {
+    const cutoff = Date.now() - this.windowMs;
+    for (const [n, t] of this.nonces) {
+      if (t < cutoff) this.nonces.delete(n);
+    }
+  }
+
+  destroy() {
+    clearInterval(this._gcInterval);
+    this.nonces.clear();
+  }
+}
+
+/* ─────────────────────── Tool Integrity ─────────────────────── */
+
+/**
+ * Sign an MCP tool definition.
+ * Hashes the ENTIRE tool object (name + description + inputSchema) using JCS.
+ * Optionally binds to author_origin to prevent tool relaying attacks.
+ *
+ * Supports HSM/KMS: pass an external signer instead of a PEM key.
+ *
+ * @param {object} tool - MCP tool { name, description, inputSchema }
+ * @param {string|Function|{sign:Function}} privateKey - PEM key OR external signer
+ * @param {string} [authorOrigin] - Author's server origin (binds tool to serving origin)
+ * @returns {{ signature: string, tool_hash: string }|Promise<{ signature: string, tool_hash: string }>}
+ */
+function signTool(tool, privateKey, authorOrigin) {
+  const canonical = canonicalJSON({
+    author_origin: authorOrigin || null,
+    description: tool.description,
+    inputSchema: tool.inputSchema || {},
+    name: tool.name,
+  });
+
+  const toolHash = crypto.createHash('sha256').update(canonical).digest('hex');
+
+  if (_isExternalSigner(privateKey)) {
+    return _callExternalSigner(privateKey, Buffer.from(canonical))
+      .then(signature => ({ signature, tool_hash: toolHash }));
+  }
+
+  const signature = _signBytes(canonical, privateKey);
+  return { signature, tool_hash: toolHash };
+}
+
+/**
+ * Verify an MCP tool definition's signature.
+ *
+ * @param {object} tool - MCP tool
+ * @param {string} signature - Base64 P1363 signature
+ * @param {string} publicKeyPem - PEM public key
+ * @param {string} [pinnedHash] - Previously pinned tool_hash for change detection
+ * @param {string} [authorOrigin] - Expected author origin
+ * @returns {{ valid: boolean, tool_hash: string, hash_changed: boolean }}
+ */
+function verifyTool(tool, signature, publicKeyPem, pinnedHash, authorOrigin) {
+  const canonical = canonicalJSON({
+    author_origin: authorOrigin || null,
+    description: tool.description,
+    inputSchema: tool.inputSchema || {},
+    name: tool.name,
+  });
+
+  const toolHash = crypto.createHash('sha256').update(canonical).digest('hex');
+  const hashChanged = pinnedHash ? (toolHash !== pinnedHash) : false;
+  const valid = _verifyBytes(canonical, signature, publicKeyPem);
+  return { valid, tool_hash: toolHash, hash_changed: hashChanged };
+}
+
+/* ─────────────────────── Model Integrity ─────────────────────── */
+
+/**
+ * Sign an AI model's metadata for provenance verification.
+ * Creates a cryptographic signature over the model's identity -- name, version,
+ * format, file hash, and source -- so consumers can verify the model hasn't been
+ * tampered with or substituted after signing.
+ *
+ * Supports HSM/KMS: pass an external signer instead of a PEM key.
+ *
+ * @param {object} model - Model metadata
+ * @param {string} model.name - Model name (e.g., "llama-3-8b")
+ * @param {string} model.version - Model version (e.g., "1.0.0")
+ * @param {string} model.format - Model format (e.g., "safetensors", "gguf", "onnx", "pytorch")
+ * @param {string} model.fileHash - SHA-256 hash of the model file(s)
+ * @param {string} [model.source] - Source URI (e.g., "https://huggingface.co/meta-llama/...")
+ * @param {string} [model.license] - License identifier (e.g., "MIT", "Apache-2.0", "llama3")
+ * @param {number} [model.parameterCount] - Number of parameters (e.g., 8000000000)
+ * @param {string|Function|{sign:Function}} privateKey - PEM key OR external signer
+ * @param {string} [signerIdentity] - Identity of the signer (e.g., "meta-llama", org URI)
+ * @returns {{ signature: string, model_hash: string, signed_at: string }|Promise}
+ */
+function signModel(model, privateKey, signerIdentity) {
+  const canonical = canonicalJSON({
+    file_hash: model.fileHash,
+    format: model.format || null,
+    license: model.license || null,
+    name: model.name,
+    parameter_count: model.parameterCount || null,
+    signer_identity: signerIdentity || null,
+    source: model.source || null,
+    version: model.version || null,
+  });
+
+  const modelHash = crypto.createHash('sha256').update(canonical).digest('hex');
+  const signedAt = new Date().toISOString();
+
+  if (_isExternalSigner(privateKey)) {
+    return _callExternalSigner(privateKey, Buffer.from(canonical))
+      .then(signature => ({ signature, model_hash: modelHash, signed_at: signedAt }));
+  }
+
+  const signature = _signBytes(canonical, privateKey);
+  return { signature, model_hash: modelHash, signed_at: signedAt };
+}
+
+/**
+ * Verify an AI model's signature and check for tampering.
+ *
+ * @param {object} model - Model metadata (same fields as signModel)
+ * @param {string} signature - Base64 P1363 signature
+ * @param {string} publicKeyPem - PEM public key of the signer
+ * @param {string} [pinnedHash] - Previously pinned model_hash for change detection
+ * @param {string} [signerIdentity] - Expected signer identity
+ * @returns {{ valid: boolean, model_hash: string, hash_changed: boolean }}
+ */
+function verifyModel(model, signature, publicKeyPem, pinnedHash, signerIdentity) {
+  const canonical = canonicalJSON({
+    file_hash: model.fileHash,
+    format: model.format || null,
+    license: model.license || null,
+    name: model.name,
+    parameter_count: model.parameterCount || null,
+    signer_identity: signerIdentity || null,
+    source: model.source || null,
+    version: model.version || null,
+  });
+
+  const modelHash = crypto.createHash('sha256').update(canonical).digest('hex');
+  const hashChanged = pinnedHash ? (modelHash !== pinnedHash) : false;
+  const valid = _verifyBytes(canonical, signature, publicKeyPem);
+  return { valid, model_hash: modelHash, hash_changed: hashChanged };
+}
+
+/**
+ * Hash a model file for use with signModel/verifyModel.
+ * Streams the file to avoid loading large models into memory.
+ *
+ * @param {string} filePath - Path to the model file
+ * @returns {Promise<string>} SHA-256 hex hash
+ */
+function hashModelFile(filePath) {
+  const fs = require('fs');
+  return new Promise((resolve, reject) => {
+    const hash = crypto.createHash('sha256');
+    const stream = fs.createReadStream(filePath);
+    stream.on('data', chunk => hash.update(chunk));
+    stream.on('end', () => resolve(hash.digest('hex')));
+    stream.on('error', reject);
+  });
+}
+
+/* ─────────────────────── Transcript Binding (Anti-Downgrade) ─────────────────────── */
+
+/**
+ * Create a transcript binding (formerly "transcript MAC").
+ * Uses ECDSA signatures (asymmetric), NOT MAC (symmetric) -- hence the rename.
+ *
+ * Both parties sign the agreed-upon security parameters to prevent an active
+ * attacker from stripping MCPS capability during handshake.
+ *
+ * IMPORTANT: transcript covers initialize `params` (client) and `result` (server),
+ * NOT the full JSON-RPC envelope. This is the security-relevant boundary.
+ *
+ * Supports HSM/KMS: pass an external signer instead of a PEM key.
+ *
+ * @param {object} clientInitParams - Client's initialize params (capabilities, clientInfo)
+ * @param {object} serverInitResult - Server's initialize result (capabilities, serverInfo)
+ * @param {string|Function|{sign:Function}} privateKey - PEM key OR external signer
+ * @returns {{ transcript_hash: string, transcript_signature: string }|Promise}
+ */
+function createTranscriptBinding(clientInitParams, serverInitResult, privateKey) {
+  const clientJCS = canonicalJSON(clientInitParams);
+  const serverJCS = canonicalJSON(serverInitResult);
+  const transcriptHash = crypto.createHash('sha256')
+    .update(clientJCS + serverJCS)
+    .digest('hex');
+
+  if (_isExternalSigner(privateKey)) {
+    return _callExternalSigner(privateKey, Buffer.from(transcriptHash))
+      .then(transcriptSignature => ({ transcript_hash: transcriptHash, transcript_signature: transcriptSignature }));
+  }
+
+  const transcriptSignature = _signBytes(transcriptHash, privateKey);
+  return { transcript_hash: transcriptHash, transcript_signature: transcriptSignature };
+}
+
+/**
+ * Verify a transcript binding from the other party.
+ */
+function verifyTranscriptBinding(transcriptHash, transcriptSignature, publicKeyPem, clientInitParams, serverInitResult) {
+  const clientJCS = canonicalJSON(clientInitParams);
+  const serverJCS = canonicalJSON(serverInitResult);
+  const expectedHash = crypto.createHash('sha256')
+    .update(clientJCS + serverJCS)
+    .digest('hex');
+
+  if (transcriptHash !== expectedHash) {
+    return { valid: false, error: ERROR_CODES.CAPABILITY_MISMATCH };
+  }
+
+  const valid = _verifyBytes(transcriptHash, transcriptSignature, publicKeyPem);
+  return valid ? { valid: true } : { valid: false, error: ERROR_CODES.CAPABILITY_MISMATCH };
+}
+
+// Backwards-compatible aliases (renamed from MAC to Binding)
+const createTranscriptMAC = createTranscriptBinding;
+const verifyTranscriptMAC = verifyTranscriptBinding;
+
+/* ─────────────────────── Version Negotiation ─────────────────────── */
+
+/**
+ * Negotiate the highest mutually supported MCPS version.
+ *
+ * @param {string|string[]} clientVersions - Client's supported versions
+ * @param {string[]} [serverVersions] - Server's supported versions (defaults to SUPPORTED_VERSIONS)
+ * @returns {string|null} Highest mutual version, or null if none
+ */
+function negotiateVersion(clientVersions, serverVersions) {
+  if (!Array.isArray(clientVersions)) clientVersions = [clientVersions];
+  if (!serverVersions) serverVersions = SUPPORTED_VERSIONS;
+  if (!Array.isArray(serverVersions)) serverVersions = [serverVersions];
+
+  const mutual = clientVersions.filter(v => serverVersions.includes(v));
+  if (mutual.length === 0) return null;
+
+  // Sort by version descending (highest first)
+  mutual.sort((a, b) => {
+    const [aMaj = 0, aMin = 0] = a.split('.').map(Number);
+    const [bMaj = 0, bMin = 0] = b.split('.').map(Number);
+    return bMaj - aMaj || bMin - aMin;
+  });
+  return mutual[0];
+}
+
+/* ─────────────────────── Revocation Client ─────────────────────── */
+
+/**
+ * Check passport revocation status against the Trust Authority.
+ * Revocation endpoint is discovered from TA metadata, NOT from the verified party.
+ */
+async function checkRevocation(passportId, trustAuthority = DEFAULT_TRUST_AUTHORITY, taPublicKey = null) {
+  return new Promise((resolve) => {
+    const url = new URL(`/api/verify/${passportId}`, trustAuthority);
+    const transport = url.protocol === 'https:' ? https : http;
+
+    const req = transport.get(url.href, { timeout: 5000 }, (res) => {
+      let body = '';
+      res.on('data', (d) => body += d);
+      res.on('end', () => {
+        try {
+          const data = JSON.parse(body);
+
+          // Verify signature on revocation response if TA public key provided
+          let verified = false;
+          if (taPublicKey && data.signature) {
+            const { signature: sig, ...rest } = data;
+            const payload = canonicalJSON(rest);
+            verified = _verifyBytes(payload, sig, taPublicKey);
+          }
+
+          resolve({
+            status: data.status || 'UNKNOWN',
+            revoked: data.status === 'REVOKED',
+            reason: data.reason || null,
+            revoked_at: data.revoked_at || null,
+            verified,
+          });
+        } catch {
+          resolve({ status: 'UNKNOWN', revoked: false, reason: 'parse_error', verified: false });
+        }
+      });
+    });
+
+    req.on('error', () => {
+      resolve({ status: 'UNREACHABLE', revoked: false, reason: 'network_error', verified: false });
+    });
+
+    req.on('timeout', () => {
+      req.destroy();
+      resolve({ status: 'UNREACHABLE', revoked: false, reason: 'timeout', verified: false });
+    });
+  });
+}
+
+/* ─────────────────────── MCPS Middleware ─────────────────────── */
+
+/**
+ * Create an MCPS-secured wrapper around an MCP server.
+ * Implements fail-closed by default when Trust Authority is unreachable.
+ * Supports multiple Trust Authorities via opts.trustAuthorities array.
+ */
+function secureMCP(mcpServer, opts = {}) {
+  const nonceStore = new NonceStore();
+  const passportCache = new Map();
+  const trustAuthorities = opts.trustAuthorities || [opts.trustAuthority || DEFAULT_TRUST_AUTHORITY];
+  const minTrustLevel = opts.minTrustLevel ?? TRUST_LEVELS.VERIFIED;
+  const serverOrigin = opts.origin || null;
+  const trustedIssuers = opts.trustedIssuers || null;
+
+  const audit = (event, data) => {
+    if (opts.auditLog !== false) {
+      const entry = { timestamp: new Date().toISOString(), event, ...data };
+      if (opts.onAudit) opts.onAudit(entry);
+    }
+  };
+
+  return {
+    _mcpServer: mcpServer,
+    _nonceStore: nonceStore,
+    _mcpsVersion: MCPS_VERSION,
+
+    async handleMessage(envelope) {
+      if (!envelope?.mcps || !envelope?.mcps?.passport_id) {
+        audit('rejected', { reason: 'invalid_format' });
+        return { error: ERROR_CODES.INVALID_SIGNATURE };
+      }
+
+      const passportId = envelope.mcps.passport_id;
+
+      if (!nonceStore.check(envelope.mcps.nonce)) {
+        audit('rejected', { reason: 'replay_attack', passport_id: passportId });
+        return { error: ERROR_CODES.REPLAY_ATTACK };
+      }
+
+      let passport = passportCache.get(passportId);
+      if (!passport) {
+        // Try each trust authority (multi-TA support)
+        let revCheck = null;
+        for (const ta of trustAuthorities) {
+          revCheck = await checkRevocation(passportId, ta);
+          if (revCheck.status !== 'UNREACHABLE') break;
+        }
+
+        if (revCheck.revoked) {
+          audit('rejected', { reason: 'revoked', passport_id: passportId });
+          if (opts.onRevoked) opts.onRevoked(passportId, revCheck.reason);
+          return { error: ERROR_CODES.PASSPORT_REVOKED };
+        }
+        if (revCheck.status === 'UNREACHABLE') {
+          audit('rejected', { reason: 'authority_unreachable_fail_closed', passport_id: passportId });
+          return { error: ERROR_CODES.AUTHORITY_UNREACHABLE };
+        }
+        passport = { passport_id: passportId, trust_level: revCheck.trust_level || TRUST_LEVELS.VERIFIED };
+        // Fetch public key via lookup if provided
+        if (opts.getPublicKey) {
+          const pubKey = await opts.getPublicKey(passportId);
+          if (pubKey) passport.public_key = pubKey;
+        }
+        passportCache.set(passportId, passport);
+      }
+
+      const effectiveLevel = getEffectiveTrustLevel(passport, trustedIssuers);
+      if (effectiveLevel < minTrustLevel) {
+        audit('rejected', { reason: 'insufficient_trust', passport_id: passportId, level: effectiveLevel });
+        return { error: ERROR_CODES.INSUFFICIENT_TRUST };
+      }
+
+      if (serverOrigin && passport.origin) {
+        const originResult = validateOrigin(passport, serverOrigin);
+        if (!originResult.valid) {
+          audit('rejected', { reason: 'origin_mismatch', passport_id: passportId });
+          return { error: ERROR_CODES.ORIGIN_MISMATCH };
+        }
+      }
+
+      // Signature verification: always verify when public key is available
+      if (passport.public_key) {
+        const pubPem = typeof passport.public_key === 'string'
+          ? passport.public_key
+          : crypto.createPublicKey({ key: passport.public_key, format: 'jwk' }).export({ type: 'spki', format: 'pem' });
+
+        const sigResult = verifyMessage(envelope, pubPem);
+        if (!sigResult.valid) {
+          audit('rejected', { reason: 'invalid_signature', passport_id: passportId });
+          return { error: sigResult.error };
+        }
+      } else {
+        // No public key available -- fail closed
+        audit('rejected', { reason: 'no_public_key', passport_id: passportId });
+        return { error: ERROR_CODES.INVALID_SIGNATURE };
+      }
+
+      const { mcps: _mcps, ...jsonrpcMessage } = envelope;
+
+      audit('accepted', {
+        passport_id: passportId,
+        method: jsonrpcMessage.method,
+        id: jsonrpcMessage.id,
+      });
+
+      if (mcpServer && typeof mcpServer.handleMessage === 'function') {
+        return mcpServer.handleMessage(jsonrpcMessage);
+      }
+      return { result: 'ok' };
+    },
+
+    sign(mcpMessage) {
+      return signMessage(mcpMessage, opts.passport, opts.privateKey);
+    },
+
+    destroy() {
+      nonceStore.destroy();
+      passportCache.clear();
+    },
+  };
+}
+
+/**
+ * Create an MCPS client wrapper for verifying server responses.
+ */
+function secureMCPClient(mcpClient, opts = {}) {
+  const nonceStore = new NonceStore();
+  const trustAuthority = opts.trustAuthority || DEFAULT_TRUST_AUTHORITY;
+
+  return {
+    _mcpClient: mcpClient,
+    _mcpsVersion: MCPS_VERSION,
+
+    send(mcpMessage, passportId, privateKey) {
+      const envelope = signMessage(mcpMessage, passportId, privateKey);
+      if (mcpClient && typeof mcpClient.send === 'function') {
+        return mcpClient.send(envelope);
+      }
+      return envelope;
+    },
+
+    async verify(envelope, publicKeyPem) {
+      if (!envelope?.mcps) return { valid: false, error: ERROR_CODES.INVALID_SIGNATURE };
+
+      const passportId = envelope.mcps.passport_id;
+
+      const revCheck = await checkRevocation(passportId, trustAuthority);
+      if (revCheck.revoked) {
+        if (opts.onRevoked) opts.onRevoked(passportId, revCheck.reason);
+        return { valid: false, error: ERROR_CODES.PASSPORT_REVOKED };
+      }
+
+      if (!nonceStore.check(envelope.mcps.nonce)) {
+        return { valid: false, error: ERROR_CODES.REPLAY_ATTACK };
+      }
+
+      // Verify signature if public key is provided or available via lookup
+      const pubKey = publicKeyPem || (opts.getPublicKey && await opts.getPublicKey(passportId));
+      if (pubKey) {
+        const sigResult = verifyMessage(envelope, pubKey);
+        if (!sigResult.valid) {
+          return { valid: false, error: sigResult.error };
+        }
+      }
+
+      return { valid: true, passport_id: passportId };
+    },
+
+    destroy() {
+      nonceStore.destroy();
+    },
+  };
+}
+
+/* ─────────────────────── HSM/KMS Signer Helpers ─────────────────────── */
+
+/**
+ * Create an external signer from a signing function.
+ * This is a convenience wrapper — you can also pass bare functions directly.
+ *
+ * The signer function receives a Buffer of data to sign and must return
+ * a base64-encoded IEEE P1363 signature (64 bytes: 32-byte r + 32-byte s).
+ *
+ * IMPORTANT: Your HSM/KMS must be configured for:
+ *   - Algorithm: ECDSA with P-256 (secp256r1 / prime256v1)
+ *   - Hash: SHA-256 (applied by MCPS before calling signer, OR by HSM — see prehash option)
+ *   - Output: IEEE P1363 fixed-length r||s format (NOT DER/ASN.1)
+ *
+ * Most cloud KMS services (AWS, Azure, GCP) support P1363 output natively.
+ * If your HSM only outputs DER, use the derToP1363() helper below.
+ *
+ * --- HOW ENTERPRISES CONNECT TO HSMs ---
+ *
+ * AWS CloudHSM / KMS:
+ *   const { KMSClient, SignCommand } = require('@aws-sdk/client-kms');
+ *   const kms = new KMSClient({ region: 'eu-west-2' });
+ *   const signer = createExternalSigner(async (data) => {
+ *     const cmd = new SignCommand({
+ *       KeyId: 'arn:aws:kms:eu-west-2:123456:key/abc-def',
+ *       Message: data,
+ *       MessageType: 'RAW',
+ *       SigningAlgorithm: 'ECDSA_SHA_256',
+ *     });
+ *     const res = await kms.send(cmd);
+ *     return derToP1363(Buffer.from(res.Signature));  // AWS returns DER
+ *   });
+ *
+ * Azure Key Vault:
+ *   const { CryptographyClient } = require('@azure/keyvault-keys');
+ *   const client = new CryptographyClient(keyUrl, credential);
+ *   const signer = createExternalSigner(async (data) => {
+ *     const digest = crypto.createHash('sha256').update(data).digest();
+ *     const result = await client.sign('ES256', digest);
+ *     return result.result;  // Azure returns P1363 natively
+ *   }, { prehash: false });  // Azure needs pre-hashed input
+ *
+ * GCP Cloud KMS:
+ *   const { KeyManagementServiceClient } = require('@google-cloud/kms');
+ *   const kms = new KeyManagementServiceClient();
+ *   const signer = createExternalSigner(async (data) => {
+ *     const digest = crypto.createHash('sha256').update(data).digest();
+ *     const [result] = await kms.asymmetricSign({
+ *       name: 'projects/my-proj/locations/global/keyRings/mcps/cryptoKeys/agent/cryptoKeyVersions/1',
+ *       digest: { sha256: digest },
+ *     });
+ *     return derToP1363(Buffer.from(result.signature, 'base64'));  // GCP returns DER
+ *   }, { prehash: false });
+ *
+ * PKCS#11 (Thales Luna, nShield, YubiKey):
+ *   const pkcs11 = require('pkcs11js');
+ *   const lib = new pkcs11.PKCS11();
+ *   lib.load('/usr/lib/softhsm/libsofthsm2.so');  // or vendor .so/.dylib
+ *   lib.C_Initialize();
+ *   // ... open session, login, find key handle ...
+ *   const signer = createExternalSigner(async (data) => {
+ *     lib.C_SignInit(session, { mechanism: pkcs11.CKM_ECDSA_SHA256 }, keyHandle);
+ *     const sig = lib.C_Sign(session, data, Buffer.alloc(64));
+ *     return sig;  // PKCS#11 CKM_ECDSA returns P1363 natively
+ *   });
+ *
+ * @param {Function} signFn - async (data: Buffer) => Buffer|string
+ * @param {object} [opts]
+ * @param {boolean} [opts.prehash=true] - If false, MCPS will NOT hash data before passing to signer
+ *   (use when your HSM expects a pre-hashed digest, e.g. Azure, GCP)
+ * @returns {{ sign: Function }}
+ */
+function createExternalSigner(signFn, opts = {}) {
+  if (typeof signFn !== 'function') {
+    throw new Error('createExternalSigner requires an async function');
+  }
+  const signer = { sign: signFn, _external: true };
+  if (opts.prehash === false) signer._prehash = false;
+  return signer;
+}
+
+/**
+ * Convert a DER-encoded ECDSA signature to IEEE P1363 fixed-length format.
+ * Use this when your HSM returns DER/ASN.1 signatures (AWS KMS, GCP Cloud KMS).
+ *
+ * DER format: 0x30 [len] 0x02 [r-len] [r] 0x02 [s-len] [s]
+ * P1363 format: [r padded to 32 bytes] [s padded to 32 bytes]
+ *
+ * @param {Buffer} derSig - DER-encoded ECDSA signature
+ * @returns {Buffer} 64-byte P1363 signature
+ */
+function derToP1363(derSig) {
+  if (!Buffer.isBuffer(derSig)) derSig = Buffer.from(derSig);
+
+  // Parse DER: SEQUENCE { INTEGER r, INTEGER s }
+  let offset = 0;
+  if (derSig[offset++] !== 0x30) throw new Error('Not a DER SEQUENCE');
+  const seqLen = derSig[offset++];
+  if (seqLen & 0x80) throw new Error('Long-form DER length not supported for P-256');
+
+  // Parse r
+  if (derSig[offset++] !== 0x02) throw new Error('Expected INTEGER tag for r');
+  const rLen = derSig[offset++];
+  const r = derSig.subarray(offset, offset + rLen);
+  offset += rLen;
+
+  // Parse s
+  if (derSig[offset++] !== 0x02) throw new Error('Expected INTEGER tag for s');
+  const sLen = derSig[offset++];
+  const s = derSig.subarray(offset, offset + sLen);
+
+  // Pad/trim to exactly 32 bytes each (P-256)
+  const result = Buffer.alloc(64);
+  // r: strip leading zero if present, right-align to 32 bytes
+  const rTrimmed = r[0] === 0 && rLen > 32 ? r.subarray(1) : r;
+  rTrimmed.copy(result, 32 - rTrimmed.length);
+  // s: strip leading zero if present, right-align to 32 bytes
+  const sTrimmed = s[0] === 0 && sLen > 32 ? s.subarray(1) : s;
+  sTrimmed.copy(result, 64 - sTrimmed.length);
+
+  return result;
+}
+
+/* ─────────────────────── Exports ─────────────────────── */
+
+module.exports = {
+  // Version and protocol
+  MCPS_VERSION,
+  SUPPORTED_VERSIONS,
+  TRUST_LEVELS,
+  ERROR_CODES,
+
+  // Limits
+  MAX_ISSUER_CHAIN_DEPTH,
+  MAX_PASSPORT_BYTES,
+  MAX_CAPABILITIES,
+
+  // RFC 8785 Canonicalization
+  canonicalJSON,
+
+  // Key management
+  generateKeyPair,
+  publicKeyToJWK,
+
+  // Passports
+  createPassport,
+  signPassport,
+  verifyPassportSignature,
+  isPassportExpired,
+  validatePassportFormat,
+  validateOrigin,
+  getEffectiveTrustLevel,
+  verifyIssuerChain,
+
+  // Message signing
+  signMessage,
+  verifyMessage,
+
+  // Tool integrity
+  signTool,
+  verifyTool,
+
+  // Model integrity
+  signModel,
+  verifyModel,
+  hashModelFile,
+
+  // Transcript binding (anti-downgrade) -- uses ECDSA signatures, not MAC
+  createTranscriptBinding,
+  verifyTranscriptBinding,
+  createTranscriptMAC,       // backwards-compatible alias
+  verifyTranscriptMAC,       // backwards-compatible alias
+
+  // Version negotiation
+  negotiateVersion,
+
+  // Revocation
+  checkRevocation,
+
+  // Middleware
+  secureMCP,
+  secureMCPClient,
+
+  // HSM/KMS support
+  createExternalSigner,
+  derToP1363,
+
+  // Internals
+  NonceStore,
+};
