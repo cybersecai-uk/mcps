@@ -3,7 +3,9 @@
 **The HTTPS of the agent era.** Cryptographic identity, message signing, and trust verification for the [Model Context Protocol](https://modelcontextprotocol.io).
 
 [![npm](https://img.shields.io/npm/v/mcp-secure?color=059669&label=npm)](https://www.npmjs.com/package/mcp-secure)
+[![npm downloads](https://img.shields.io/npm/dw/mcp-secure)](https://www.npmjs.com/package/mcp-secure)
 [![PyPI](https://img.shields.io/pypi/v/mcp-secure?color=059669&label=pypi)](https://pypi.org/project/mcp-secure/)
+[![license](https://img.shields.io/npm/l/mcp-secure)](https://github.com/cybersecai-uk/mcps/blob/main/LICENSE)
 [![IETF Draft](https://img.shields.io/badge/IETF-draft--sharif--mcps--00-blue)](https://datatracker.ietf.org/doc/draft-sharif-mcps-secure-mcp/)
 [![Tests](https://img.shields.io/badge/tests-78%20passed-brightgreen)]()
 [![License](https://img.shields.io/badge/license-MIT-green)]()
