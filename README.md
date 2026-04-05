@@ -1,5 +1,7 @@
 # MCPS -- MCP Secure
 
+![trust](https://agentsearch.cybersecai.co.uk/badge/mcp-secure)
+
 **The HTTPS of the agent era.** Cryptographic identity, message signing, and trust verification for the [Model Context Protocol](https://modelcontextprotocol.io).
 
 [![npm](https://img.shields.io/npm/v/mcp-secure?color=059669&label=npm)](https://www.npmjs.com/package/mcp-secure)
