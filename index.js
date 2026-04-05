@@ -4,7 +4,7 @@
  *
  * Copyright (c) 2026 CyberSecAI Ltd. All rights reserved.
  * Patent: GB2604808.2
- * License: MIT
+ * License: BSL 1.1 (Business Source License)
  *
  * Specification: SEP-2395 (Cryptographic Security Layer for MCP)
  * Canonicalization: RFC 8785 (JSON Canonicalization Scheme)

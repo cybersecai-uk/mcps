@@ -10,7 +10,7 @@
 [![license](https://img.shields.io/npm/l/mcp-secure)](https://github.com/cybersecai-uk/mcps/blob/main/LICENSE)
 [![IETF Draft](https://img.shields.io/badge/IETF-draft--sharif--mcps--00-blue)](https://datatracker.ietf.org/doc/draft-sharif-mcps-secure-mcp/)
 [![Tests](https://img.shields.io/badge/tests-78%20passed-brightgreen)]()
-[![License](https://img.shields.io/badge/license-MIT-green)]()
+[![License](https://img.shields.io/badge/license-BSL%201.1-blue)]()
 [![Zero Dependencies](https://img.shields.io/badge/node--deps-0-brightgreen)]()
 
 ### [Try it live in your browser -- no install needed](https://agentsign.dev/playground)
@@ -299,6 +299,8 @@ docker run -p 8080:8080 agentsign/server
 
 ## License
 
-MIT. Patent pending (GB2604808.2).
+BSL 1.1 (Business Source License). Patent pending (GB2604808.2).
 
-Built by [CyberSecAI Ltd](https://agentsign.dev).
+Free for non-commercial use including security research, education, and internal testing. Commercial use requires a license. Contact: contact@agentsign.dev
+
+Built by [CyberSecAI Ltd](https://cybersecai.co.uk).
